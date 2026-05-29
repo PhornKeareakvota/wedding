@@ -1,6 +1,6 @@
 {
   "name": "Wedding Guest Manager",
   "description": "A high-fidelity single-file wedding guest registration and management platform, with role-based views for public guests, event admin coordinators, and couple hosts.",
-  "requestFramePermissions": [],
+  "requestFramePermissions": ["camera"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

@@ -322,6 +322,18 @@ export default function App() {
   const [registrationSubmitted, setRegistrationSubmitted] = useState(false);
   const [lastSubmittedGuest, setLastSubmittedGuest] = useState<Guest | null>(null);
 
+  // QR Code Scanner States
+  const [isQrScannerOpen, setIsQrScannerOpen] = useState(false);
+  const [scannedGuest, setScannedGuest] = useState<Guest | null>(null);
+  const [qrScannerError, setQrScannerError] = useState<string | null>(null);
+  const [qrScanFeedback, setQrScanFeedback] = useState<'success' | 'invalid' | 'already_approved' | null>(null);
+
+  // Scanner React refs
+  const videoRef = React.useRef<HTMLVideoElement | null>(null);
+  const canvasRef = React.useRef<HTMLCanvasElement | null>(null);
+  const streamRef = React.useRef<MediaStream | null>(null);
+  const isScanningRef = React.useRef<boolean>(false);
+
   const handleGuestSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!activeWedding) {
@@ -577,6 +589,155 @@ export default function App() {
     } finally {
       setLoading(false);
     }
+  };
+
+  // ==========================================
+  // QR CODE SCANNING ENGINE
+  // ==========================================
+  const playBeep = (type: 'success' | 'error' | 'bell') => {
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      
+      if (type === 'success') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(880, ctx.currentTime); // A5 note
+        gain.gain.setValueAtTime(0.08, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.15);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.15);
+      } else if (type === 'bell') {
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(587.33, ctx.currentTime); // D5 note
+        gain.gain.setValueAtTime(0.1, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.4);
+      } else {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(150, ctx.currentTime); // G2 buzzer
+        gain.gain.setValueAtTime(0.15, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.35);
+      }
+    } catch (e) {
+      console.warn("AudioContext beep failed:", e);
+    }
+  };
+
+  const startScanner = async () => {
+    setQrScannerError(null);
+    setScannedGuest(null);
+    setQrScanFeedback(null);
+    isScanningRef.current = true;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' }
+      });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.setAttribute('playsinline', 'true');
+        videoRef.current.play();
+      }
+      requestAnimationFrame(tickScanner);
+    } catch (err: any) {
+      console.error("Camera access error:", err);
+      setQrScannerError("មិនអាចបើកកាមេរ៉ាបានទេ! សូមប្រាកដថាអ្នកបានអនុញ្ញាតសិទ្ធិប្រើប្រាស់កាមេរ៉ាក្នុង Browser របស់អ្នករួចរាល់។");
+      isScanningRef.current = false;
+    }
+  };
+
+  const stopScanner = () => {
+    isScanningRef.current = false;
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+  };
+
+  const tickScanner = async () => {
+    if (!isScanningRef.current) return;
+
+    if (videoRef.current && canvasRef.current && videoRef.current.readyState === videoRef.current.HAVE_CURRENT_DATA) {
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        canvas.height = video.videoHeight;
+        canvas.width = video.videoWidth;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        
+        try {
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const { default: jsQR } = await import('jsqr');
+          const code = jsQR(imageData.data, imageData.width, imageData.height, {
+            inversionAttempts: 'dontInvert',
+          });
+          
+          if (code && code.data) {
+            if (code.data.startsWith("wedding-guest-id:")) {
+              const guestId = code.data.substring("wedding-guest-id:".length).trim();
+              
+              // Find the guest in our guests list
+              const matchedGuest = guests.find(g => g.id === guestId);
+              if (matchedGuest) {
+                isScanningRef.current = false;
+                setScannedGuest(matchedGuest);
+                setSearchQuery(matchedGuest.name); // Set query for search behind
+                
+                if (matchedGuest.status === 'approved') {
+                  setQrScanFeedback('already_approved');
+                  playBeep('bell');
+                } else {
+                  setQrScanFeedback('success');
+                  playBeep('success');
+                }
+              } else {
+                setQrScannerError("រកមិនឃើញព័ត៌មានភ្ញៀវរូបនេះក្នុងបញ្ជីឡើយ! QR code សម្រេចលែងប្រើ ឬមិនត្រឹមត្រូវ។");
+                playBeep('error');
+                isScanningRef.current = false;
+              }
+            } else {
+              setQrScannerError("QR Code នេះមិនមែនជាសំបុត្រភ្ញៀវផ្លូវការនៃប្រព័ន្ធមង្គលការឡើយ។");
+              playBeep('error');
+              isScanningRef.current = false;
+            }
+          }
+        } catch (e) {
+          console.error("Scanning decoding error:", e);
+        }
+      }
+    }
+
+    if (isScanningRef.current) {
+      requestAnimationFrame(tickScanner);
+    }
+  };
+
+  const handleApproveScannedGuest = async (id: string) => {
+    await handleApproveGuest(id);
+    setScannedGuest(prev => prev && prev.id === id ? { ...prev, status: 'approved' as const } : prev);
+    playBeep('bell');
+  };
+
+  const handleScanAgain = () => {
+    setScannedGuest(null);
+    setQrScanFeedback(null);
+    setQrScannerError(null);
+    isScanningRef.current = true;
+    requestAnimationFrame(tickScanner);
   };
 
   // Filter & Search compiled admin guest view
@@ -949,45 +1110,89 @@ export default function App() {
 
               {registrationSubmitted && lastSubmittedGuest ? (
                 // Success Registration Card Animation
-                <div className="bg-emerald-50/70 border border-emerald-100 rounded-xl p-6 text-center shadow-inner relative overflow-hidden">
-                  <div className="absolute top-0 left-0 w-full h-1 bg-emerald-500"></div>
-                  <div className="mx-auto w-12 h-12 bg-emerald-100 rounded-full flex items-center justify-center text-emerald-600 mb-3 animate-bounce">
+                <div className="bg-emerald-50/40 border border-emerald-100 rounded-2xl p-6 text-center shadow-inner relative overflow-hidden space-y-5">
+                  <div className="absolute top-0 inset-x-0 h-1.5 bg-emerald-500"></div>
+                  <div className="mx-auto w-12 h-12 bg-emerald-100 rounded-full flex items-center justify-center text-emerald-600 mb-1 animate-bounce">
                     <Check size={28} />
                   </div>
-                  <h4 className="text-lg font-bold text-slate-950 font-serif">ការចុះឈ្មោះបានជោគជ័យ! 🎉</h4>
-                  <p className="text-slate-700 text-xs mt-2 leading-relaxed">
-                    សូមអរគុណបង <strong>{lastSubmittedGuest.name}</strong> សម្រាប់ការចុះឈ្មោះចូលរួមថ្ងៃមង្គលការដ៏ឧត្តុង្គឧត្តមនេះ។
-                  </p>
+                  <div>
+                    <h4 className="text-lg font-bold text-slate-950 font-serif font-sans">ការចុះឈ្មោះបានជោគជ័យ! 🎉</h4>
+                    <p className="text-slate-700 text-xs mt-1.5 leading-relaxed font-sans">
+                      សូមអរគុណបង <strong>{lastSubmittedGuest.name}</strong> សម្រាប់ការចុះឈ្មោះចូលរួមថ្ងៃមង្គលការដ៏ឧត្តុង្គឧត្តមនេះ។
+                    </p>
+                  </div>
                   
-                  <div className="my-4 bg-white p-3 rounded-lg border border-emerald-100 text-left space-y-2 text-xs divide-y divide-slate-100 font-sans">
-                    <div className="flex justify-between py-1">
-                      <span className="text-slate-500">ទំនាក់ទំនង៖</span>
-                      <span className="font-semibold text-slate-900">{lastSubmittedGuest.relation_type}</span>
+                  {/* Wedding Entry Pass (Ticket visual style) */}
+                  <div className="bg-white rounded-2xl border-2 border-dashed border-pink-200 overflow-hidden shadow-sm relative text-left">
+                    <div className="absolute top-1/2 -left-3 w-6 h-6 bg-[#FDF2F8] rounded-full border-r border-pink-200 flex-none -translate-y-1/2"></div>
+                    <div className="absolute top-1/2 -right-3 w-6 h-6 bg-[#FDF2F8] rounded-full border-l border-pink-200 flex-none -translate-y-1/2"></div>
+                    
+                    <div className="bg-slate-50 px-4 py-3 border-b border-pink-100 text-[10px] font-black tracking-widest text-[#E12026] flex items-center justify-between">
+                      <span>ENTRY PASS</span>
+                      <span>ID: #{lastSubmittedGuest.id.substring(0, 8).toUpperCase()}</span>
                     </div>
-                    {lastSubmittedGuest.companions > 0 && (
-                      <div className="flex justify-between py-1 pt-2">
-                        <span className="text-slate-500">ចំនួនអ្នកមកជាមួយ៖</span>
-                        <span className="font-semibold text-slate-900">{lastSubmittedGuest.companions} នាក់</span>
+                    
+                    <div className="p-4 space-y-3">
+                      <div className="flex justify-center my-1.5">
+                        <div className="bg-white p-2.5 rounded-xl border border-pink-100 inline-block shadow-sm">
+                          <img
+                            src={`https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent("wedding-guest-id:" + lastSubmittedGuest.id)}`}
+                            alt="Guest Entry QR Code"
+                            className="w-36 h-36 mx-auto"
+                            referrerPolicy="no-referrer"
+                          />
+                        </div>
                       </div>
-                    )}
-                    {lastSubmittedGuest.amount > 0 && (
-                      <div className="flex justify-between py-1 pt-2">
-                        <span className="text-slate-500">ថវិកាចងដៃ៖</span>
-                        <span className="font-bold text-emerald-600">${lastSubmittedGuest.amount} (USD)</span>
+                      
+                      <p className="text-[10px] text-slate-400 font-sans leading-relaxed px-4 text-center">
+                        សូមរក្សាទុក ឬថតរូបសំបុត្រ (QR Code) នេះទុក ដើម្បីបង្ហាញដល់អ្នករៀបចំការនៅច្រកចូលដើម្បីផ្ទៀងផ្ទាត់វត្តមាន។
+                      </p>
+
+                      <div className="my-2 p-3 bg-pink-50/50 rounded-xl border border-pink-100/50 text-left space-y-2 text-xs font-sans">
+                        <div className="flex justify-between py-1">
+                          <span className="text-slate-500 font-sans">ឈ្មោះភ្ញៀវ៖</span>
+                          <span className="font-extrabold text-slate-900 font-serif">{lastSubmittedGuest.name}</span>
+                        </div>
+                        <div className="flex justify-between py-1.5 pt-1.5 border-t border-dashed border-pink-200">
+                          <span className="text-slate-500 font-sans">ទំនាក់ទំនង៖</span>
+                          <span className="font-bold text-slate-800 font-sans">{lastSubmittedGuest.relation_type}</span>
+                        </div>
+                        {lastSubmittedGuest.companions > 0 && (
+                          <div className="flex justify-between py-1.5 pt-1.5 border-t border-dashed border-pink-200">
+                            <span className="text-slate-500 font-sans">ចំនួនអ្នកមកជាមួយ៖</span>
+                            <span className="font-extrabold text-[#E12026] font-sans">{lastSubmittedGuest.companions} នាក់</span>
+                          </div>
+                        )}
+                        {lastSubmittedGuest.amount > 0 && (
+                          <div className="flex justify-between py-1.5 pt-1.5 border-t border-dashed border-pink-200">
+                            <span className="text-slate-500 font-sans">ថវិកាចងដៃ៖</span>
+                            <span className="font-black text-pink-600 font-mono">${lastSubmittedGuest.amount} (USD)</span>
+                          </div>
+                        )}
                       </div>
-                    )}
+                    </div>
                   </div>
 
-                  <p className="text-[11px] text-slate-500 leading-normal mb-4 font-sans italic">
-                    * ស្ថានភាពចុះឈ្មោះបច្ចុប្បន្នគឺ <span className="text-amber-600 font-bold bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200">រង់ចាំការពិនិត្យ (Pending)</span>។ សូមរង់ចាំអ្នកសម្របសម្រួលអនុម័ត វត្តមានរបស់អ្នកនឹងបង្ហាញនៅក្នុងបញ្ជីភ្ញៀវផ្លូវការទើបសម្រេច។
+                  <p className="text-[10px] text-slate-500 leading-relaxed font-sans italic">
+                    * ស្ថានភាពចុះឈ្មោះ៖ <span className="text-amber-600 font-bold bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200">រង់ចាំរៀបចំ (Pending)</span>។ បន្ទាប់ពីចៅហ្វាយនាយពិនិត្យ វត្តមាននឹងត្រូវបានយល់ព្រម!
                   </p>
 
-                  <button 
-                    onClick={() => setRegistrationSubmitted(false)}
-                    className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-semibold transition-all shadow"
-                  >
-                    ចុះឈ្មោះភ្ញៀវផ្សេងទៀត &rarr;
-                  </button>
+                  <div className="flex gap-2 justify-center">
+                    <button
+                      onClick={() => {
+                        window.print();
+                      }}
+                      className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-xs font-bold transition-all shadow flex items-center gap-1.5 cursor-pointer"
+                    >
+                      បោះពុម្ភសំបុត្រ
+                    </button>
+                    <button 
+                      onClick={() => setRegistrationSubmitted(false)}
+                      className="px-3.5 py-2 bg-pink-500 hover:bg-pink-600 text-white rounded-xl text-xs font-bold transition-all shadow cursor-pointer font-sans"
+                    >
+                      ចុះឈ្មោះផ្សេងទៀត &rarr;
+                    </button>
+                  </div>
                 </div>
               ) : (
                 // Standard Application Entry Form
@@ -1250,6 +1455,18 @@ export default function App() {
                     >
                       <Plus size={15} />
                       បន្ថែមភ្ញៀវដោយផ្ទាល់
+                    </button>
+
+                    <button
+                      id="btn-admin-qr-scan"
+                      onClick={() => {
+                        setIsQrScannerOpen(true);
+                        startScanner();
+                      }}
+                      className="px-4 py-2 bg-[#E12026] hover:bg-red-700 text-white rounded-xl text-xs font-bold transition-all shadow flex items-center gap-1.5 cursor-pointer font-sans"
+                    >
+                      <QrCode size={15} />
+                      ស្កេន QR កូដភ្ញៀវ
                     </button>
 
                     <button
@@ -1578,6 +1795,194 @@ export default function App() {
                           </button>
                         </div>
                       </form>
+                    </div>
+                  </div>
+                )}
+
+                {/* ============================================== */}
+                {/* 📷 MODAL: CAMERA QR CODE SCANNER */}
+                {/* ============================================== */}
+                {isQrScannerOpen && (
+                  <div className="fixed inset-0 z-50 bg-slate-900/70 backdrop-blur-md flex items-center justify-center p-4">
+                    <div className="bg-white rounded-3xl border border-pink-100 w-full max-w-lg overflow-hidden shadow-2xl animate-in fade-in zoom-in duration-200">
+                      
+                      {/* Header bar */}
+                      <div className="bg-[#E12026] p-4 text-white flex justify-between items-center font-sans shadow-md">
+                        <div className="flex items-center gap-2">
+                          <QrCode size={18} className="animate-pulse" />
+                          <span className="font-extrabold text-sm tracking-wide font-serif">ម៉ាស៊ីនស្កេនសំបុត្រ QR កូដ</span>
+                        </div>
+                        <button 
+                          onClick={() => {
+                            stopScanner();
+                            setIsQrScannerOpen(false);
+                          }}
+                          className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-lg font-bold transition cursor-pointer"
+                          title="Close scanner"
+                        >
+                          &times;
+                        </button>
+                      </div>
+
+                      <div className="p-6 space-y-5">
+                        {/* Video feedback region */}
+                        {!scannedGuest && !qrScannerError && (
+                          <div className="relative rounded-2xl overflow-hidden border-2 border-slate-900 bg-black aspect-video flex items-center justify-center shadow-inner">
+                            <video 
+                              ref={videoRef}
+                              className="w-full h-full object-cover"
+                            />
+                            
+                            {/* Scanning overlay crosshairs */}
+                            <div className="absolute inset-0 pointer-events-none border-[32px] border-black/40 flex items-center justify-center">
+                              <div className="w-48 h-48 border-2 border-[#E12026] relative rounded-xl animate-pulse">
+                                {/* Corners styling */}
+                                <div className="absolute top-0 left-0 w-5 h-5 border-t-4 border-l-4 border-white -translate-x-1.5 -translate-y-1.5"></div>
+                                <div className="absolute top-0 right-0 w-5 h-5 border-t-4 border-r-4 border-white translate-x-1.5 -translate-y-1.5"></div>
+                                <div className="absolute bottom-0 left-0 w-5 h-5 border-b-4 border-l-4 border-white -translate-x-1.5 translate-y-1.5"></div>
+                                <div className="absolute bottom-0 right-0 w-5 h-5 border-b-4 border-r-4 border-white translate-x-1.5 translate-y-1.5"></div>
+                                
+                                {/* Red laser scan beam anim */}
+                                <div className="absolute top-1/2 left-0 w-full h-0.5 bg-[#E12026] shadow-md shadow-[#E12026]/80 animate-[ping_1.5s_infinite]"></div>
+                              </div>
+                            </div>
+
+                            <canvas 
+                              ref={canvasRef} 
+                              className="hidden" 
+                            />
+                            
+                            <div className="absolute bottom-3 inset-x-0 text-center">
+                              <span className="bg-slate-950/80 text-white text-[10px] font-bold px-3 py-1.5 rounded-full backdrop-blur-sm shadow tracking-wider font-sans">
+                                ● កំពុងរកមើល QR កូដភ្ញៀវ...
+                              </span>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Error state */}
+                        {qrScannerError && (
+                          <div className="bg-red-50 rounded-2xl border border-red-100 p-5 text-center space-y-3 font-sans">
+                            <div className="text-red-500 font-bold text-sm">⚠️ បញ្ហាស្កេនកូដ!</div>
+                            <p className="text-xs text-slate-700 leading-relaxed">
+                              {qrScannerError}
+                            </p>
+                            <div className="flex gap-2 justify-center pt-1">
+                              <button
+                                onClick={handleScanAgain}
+                                className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl shadow cursor-pointer"
+                              >
+                                ព្យាយាមម្តងទៀត
+                              </button>
+                              <button
+                                onClick={() => {
+                                  stopScanner();
+                                  setIsQrScannerOpen(false);
+                                }}
+                                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl border border-slate-200 cursor-pointer"
+                              >
+                                控បិទចោល
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Guest look-up information card (SCANNED GUEST RESULTS) */}
+                        {scannedGuest && (
+                          <div className="space-y-4 animate-in fade-in slide-in-from-bottom-3 duration-200 font-sans">
+                            {/* Feedback Header Banner */}
+                            {qrScanFeedback === 'already_approved' ? (
+                              <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 flex items-center justify-center gap-2.5 text-amber-800 font-sans">
+                                <span className="text-lg">🔔</span>
+                                <div className="text-left">
+                                  <div className="font-extrabold text-xs">វត្តមានត្រូវបានអនុម័តរួចហើយ!</div>
+                                  <div className="text-[10px] text-amber-700 font-sans">ភ្ញៀវកិត្តិយសរូបនេះបានស្កេនចូលរួចរាល់ហើយ។</div>
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-4 flex items-center justify-center gap-2.5 text-emerald-800 font-sans">
+                                <span className="text-lg">✅</span>
+                                <div className="text-left font-sans">
+                                  <div className="font-extrabold text-xs">រកឃើញព័ត៌មានភ្ញៀវ!</div>
+                                  <div className="text-[10px] text-emerald-700 font-sans">ស្កេន QR Code បានជោគជ័យ។</div>
+                                </div>
+                              </div>
+                            )}
+
+                            {/* Ticket Details Box */}
+                            <div className="bg-pink-50/10 rounded-2xl border border-pink-100 p-4 space-y-3 font-sans">
+                              <div className="flex justify-between items-center pb-2.5 border-b border-dashed border-pink-100 font-sans">
+                                <div className="font-sans">
+                                  <span className="text-[9px] font-bold uppercase tracking-widest text-[#E12026] block font-sans">GUEST RECORD</span>
+                                  <h4 className="font-extrabold text-slate-900 font-serif text-base">{scannedGuest.name}</h4>
+                                </div>
+                                <div className="font-sans">
+                                  {scannedGuest.status === 'approved' ? (
+                                    <span className="bg-emerald-100 text-emerald-800 border border-emerald-200 px-2.5 py-0.5 rounded-full text-[10px] font-black font-sans">
+                                      បានអនុម័តរួច
+                                    </span>
+                                  ) : (
+                                    <span className="bg-amber-100 text-amber-800 border border-amber-200 px-2.5 py-0.5 rounded-full text-[10px] font-black font-sans">
+                                      រង់ចាំអនុម័ត
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+
+                              <div className="grid grid-cols-2 gap-3 text-xs font-sans">
+                                <div className="p-2 bg-white rounded-xl border border-pink-50">
+                                  <div className="text-slate-400 text-[10px] font-sans">លេខទូរស័ព្ទ៖</div>
+                                  <div className="font-bold text-slate-900 pt-0.5 font-sans">{scannedGuest.phone || 'គ្មានព័ត៌មាន'}</div>
+                                </div>
+                                <div className="p-2 bg-white rounded-xl border border-pink-50">
+                                  <div className="text-slate-400 text-[10px] font-sans">ទំនាក់ទំនងភាគី៖</div>
+                                  <div className="font-bold text-slate-900 pt-0.5 font-sans">{scannedGuest.relation_type}</div>
+                                </div>
+                                <div className="p-2 bg-white rounded-xl border border-pink-50 animate-pulse">
+                                  <div className="text-slate-400 text-[10px] font-sans">ចំនួនអ្នករួមដំណើរ៖</div>
+                                  <div className="font-extrabold text-[#E12026] pt-0.5 font-sans">{scannedGuest.companions} នាក់</div>
+                                </div>
+                                <div className="p-2 bg-white rounded-xl border border-pink-50">
+                                  <div className="text-slate-400 text-[10px] font-sans">ថវិកាចងដៃ (ចម្បង)៖</div>
+                                  <div className="font-black text-pink-600 pt-0.5 font-mono">${scannedGuest.amount} (USD)</div>
+                                </div>
+                              </div>
+
+                              {scannedGuest.note && (
+                                <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-100 text-[11px] italic text-slate-600 font-sans">
+                                  &ldquo;{scannedGuest.note}&rdquo;
+                                </div>
+                              )}
+                            </div>
+
+                            {/* Control Actions Row inside QR Lookup */}
+                            <div className="flex gap-2 font-sans">
+                              {scannedGuest.status !== 'approved' && (
+                                <button
+                                  onClick={() => handleApproveScannedGuest(scannedGuest.id)}
+                                  className="flex-1 py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold rounded-2xl shadow transition text-xs font-sans cursor-pointer flex items-center justify-center gap-1.5"
+                                >
+                                  <Check size={16} />
+                                  អនុម័តការចូលរួម
+                                </button>
+                              )}
+                              
+                              <button
+                                onClick={handleScanAgain}
+                                className="flex-1 py-3 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-2xl shadow transition text-xs font-sans cursor-pointer"
+                              >
+                                ស្កេនភ្ញៀវផ្សេងទៀត &rarr;
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Explainer / Helpful tips */}
+                        <div className="text-[10px] text-slate-400 text-center leading-relaxed font-sans pt-1">
+                          * ប្រព័ន្ធគាំទ្រការស្កេន QR Code គ្រប់ប្រភេទស្មាតហ្វូន។ ព័ត៌មាននឹងត្រូវទាញយក និងផ្ទៀងផ្ទាត់ផ្ទាល់ពីទិន្នន័យមេភ្លាមៗ។
+                        </div>
+                      </div>
+
                     </div>
                   </div>
                 )}
